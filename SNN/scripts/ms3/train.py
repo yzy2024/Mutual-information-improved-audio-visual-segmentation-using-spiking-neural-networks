@@ -1,0 +1,202 @@
+import torch
+import time
+import torch.nn
+import os
+import random
+import numpy as np
+from mmengine import Config
+import argparse
+import sys
+import os
+from torch.optim.lr_scheduler import CosineAnnealingLR
+# 获取项目根目录的绝对路径，并加入 sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+from utils.loss_util import LossUtil
+from utility import mask_iou
+from utils.logger import getLogger
+from model import build_model
+from dataloader import build_dataset
+from scripts.ms3.loss import IouSemanticAwareLoss
+from utils import pyutils
+
+def calculate_fscore(pred, target, eps=1e-7):
+    """
+    计算 F1-score, precision, recall。pred, target: [B, H, W]，值为0或1
+    """
+    pred = pred.bool()
+    target = target.bool()
+
+    tp = (pred & target).float().sum()
+    fp = (pred & ~target).float().sum()
+    fn = (~pred & target).float().sum()
+
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+
+    return f1.item(), precision.item(), recall.item()
+
+def main():
+    # Fix seed
+    FixSeed = 123
+    random.seed(FixSeed)
+    np.random.seed(FixSeed)
+    torch.manual_seed(FixSeed)
+    torch.cuda.manual_seed(FixSeed)
+
+    # logger
+    log_name = time.strftime('%Y%m%d-%H%M%S', time.localtime())
+    dir_name = os.path.splitext(os.path.split(args.cfg)[-1])[0]
+    if not os.path.exists(args.log_dir):
+        os.mkdir(args.log_dir)
+    if not os.path.exists(os.path.join(args.log_dir, dir_name)):
+        os.mkdir(os.path.join(args.log_dir, dir_name))
+    log_file = os.path.join(args.log_dir, dir_name, f'{log_name}.log')
+    logger = getLogger(log_file, __name__)
+    logger.info(f'Load config from {args.cfg}')
+
+    # config
+    cfg = Config.fromfile(args.cfg)
+    logger.info(cfg.pretty_text)
+    checkpoint_dir = os.path.join(args.checkpoint_dir, dir_name)
+
+    # model
+    model = build_model(**cfg.model)
+    model = torch.nn.DataParallel(model).cuda()
+    model.train()
+    logger.info("Total params: %.2fM" % (sum(p.numel()
+                for p in model.parameters()) / 1e6))
+
+    # dataset
+    train_dataset = build_dataset(**cfg.dataset.train)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset,
+                                                   batch_size=cfg.dataset.train.batch_size,
+                                                   shuffle=True,
+                                                   num_workers=cfg.process.num_works,
+                                                   pin_memory=True)
+    max_step = (len(train_dataset) // cfg.dataset.train.batch_size) * \
+        cfg.process.train_epochs
+    val_dataset = build_dataset(**cfg.dataset.val)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset,
+                                                 batch_size=cfg.dataset.val.batch_size,
+                                                 shuffle=False,
+                                                 num_workers=cfg.process.num_works,
+                                                 pin_memory=True)
+
+    # optimizer
+    optimizer = pyutils.get_optimizer(model, cfg.optimizer)
+    # scheduler = CosineAnnealingLR(optimizer, T_max=max_step, eta_min=1e-6)
+    loss_util = LossUtil(**cfg.loss)
+    avg_meter_miou = pyutils.AverageMeter('miou')
+
+    # Train
+    best_epoch = 0
+    global_step = 0
+    miou_list = []
+    max_miou = 0
+    for epoch in range(cfg.process.train_epochs):
+        if epoch == cfg.process.freeze_epochs:
+            model.module.freeze_backbone(False)
+
+        for n_iter, batch_data in enumerate(train_dataloader):
+            imgs, audio, mask, _ = batch_data
+
+            imgs = imgs.cuda()
+            audio = audio.cuda()
+            mask = mask.cuda()
+            B, frame, C, H, W = imgs.shape
+            imgs = imgs.view(B * frame, C, H, W)
+            mask_num = 5
+            mask = mask.view(B * mask_num, 1, H, W)
+            audio = audio.view(-1, audio.shape[2],
+                               audio.shape[3], audio.shape[4])
+
+            output, mask_feature, mi_map = model(audio, imgs)
+            loss, loss_dict = IouSemanticAwareLoss(
+                output, mask_feature, mi_map, mask, **cfg.loss)
+            loss_util.add_loss(loss, loss_dict)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            # scheduler.step()
+
+            global_step += 1
+            if (global_step - 1) % 20 == 0:
+                train_log = 'Iter:%5d/%5d, %slr: %.6f' % (
+                    global_step - 1, max_step, loss_util.pretty_out(), optimizer.param_groups[0]['lr'])
+                logger.info(train_log)
+
+        # Validation:
+        model.eval()
+        total_f1, total_precision, total_recall = 0.0, 0.0, 0.0
+        f1_count = 0
+        with torch.no_grad():
+            for n_iter, batch_data in enumerate(val_dataloader):
+                # [bs, 5, 3, 224, 224], [bs, 5, 1, 96, 64], [bs, 5, 1, 224, 224]
+                imgs, audio, mask, _ = batch_data
+
+                imgs = imgs.cuda()
+                audio = audio.cuda()
+                mask = mask.cuda()
+                B, frame, C, H, W = imgs.shape
+                imgs = imgs.view(B * frame, C, H, W)
+                mask = mask.view(B * frame, H, W)
+                audio = audio.view(-1, audio.shape[2],
+                                   audio.shape[3], audio.shape[4])
+
+                # [bs*5, 1, 224, 224]
+                output, _, _ = model(audio, imgs)
+                pred = torch.sigmoid(output).squeeze(1)  # [B*T, 224, 224]
+                pred_binary = (pred > 0.5).float()
+                miou = mask_iou(output.squeeze(1), mask)
+                avg_meter_miou.add({'miou': miou})
+
+                for i in range(pred_binary.size(0)):
+                    f1, prec, rec = calculate_fscore(pred_binary[i], mask[i])
+                    total_f1 += f1
+                    total_precision += prec
+                    total_recall += rec
+                    f1_count += 1
+
+            miou = (avg_meter_miou.pop('miou'))
+            mean_f1 = total_f1 / f1_count
+            mean_precision = total_precision / f1_count
+            mean_recall = total_recall / f1_count
+            if miou > max_miou:
+                model_save_path = os.path.join(
+                    checkpoint_dir, '%s_best.pth' % (args.session_name))
+                torch.save(model.module.state_dict(), model_save_path)
+                best_epoch = epoch
+                logger.info('save best model to %s' % model_save_path)
+
+            miou_list.append(miou)
+            max_miou = max(miou_list)
+
+            # val_log = 'Epoch: {}, Miou: {}, maxMiou: {}'.format(
+            #     epoch, miou, max_miou)
+            val_log = 'Epoch: {}, Miou: {:.4f}, maxMiou: {:.4f}, F1: {:.4f}, Precision: {:.4f}, Recall: {:.4f}'.format(epoch, miou, max_miou, mean_f1, mean_precision, mean_recall)
+            logger.info(val_log)
+
+        model.train()
+    logger.info('best val Miou {} at peoch: {}'.format(max_miou, best_epoch))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    # parser.add_argument('cfg', type=str, help='config file path')
+    # parser.add_argument('--log_dir', type=str,
+    #                     default='work_dir', help='log dir')
+    # parser.add_argument('--checkpoint_dir', type=str,
+    #                     default='work_dir', help='dir to save checkpoints')
+    # parser.add_argument("--session_name", default="MS3",
+    #                     type=str, help="the MS3 setting")
+    parser.add_argument('--cfg', type=str, default='/home/songyu/vit-llm/yzy/MI_AVS_Spike/config/ms3/AVSegFormer_pvt2_ms3.py', help='config file path')
+    parser.add_argument('--log_dir', type=str,
+                        default='/home/songyu/vit-llm/yzy/MI_AVS_Spike/1', help='log dir')
+    parser.add_argument('--checkpoint_dir', type=str,
+                        default='/home/songyu/vit-llm/yzy/MI_AVS_Spike/1', help='dir to save checkpoints')
+    parser.add_argument("--session_name", default="ms3",
+                        type=str, help="the ms3 setting")
+
+    args = parser.parse_args()
+    main()

@@ -1,0 +1,12 @@
+setup.py
+/mnt/e9b3c086-bd4b-4811-b945-921803b63451/data/yzy/multisensory/AVS/AVSegFormer/ops/src/vision.cpp
+/mnt/e9b3c086-bd4b-4811-b945-921803b63451/data/yzy/multisensory/AVS/AVSegFormer/ops/src/cpu/ms_deform_attn_cpu.cpp
+/mnt/e9b3c086-bd4b-4811-b945-921803b63451/data/yzy/multisensory/AVS/AVSegFormer/ops/src/cuda/ms_deform_attn_cuda.cu
+MultiScaleDeformableAttention.egg-info/PKG-INFO
+MultiScaleDeformableAttention.egg-info/SOURCES.txt
+MultiScaleDeformableAttention.egg-info/dependency_links.txt
+MultiScaleDeformableAttention.egg-info/top_level.txt
+functions/__init__.py
+functions/ms_deform_attn_func.py
+modules/__init__.py
+modules/ms_deform_attn.py
